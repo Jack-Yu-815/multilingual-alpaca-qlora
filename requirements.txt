@@ -1,7 +1,7 @@
 bitsandbytes
-git+https://github.com/huggingface/transformers.git
-git+https://github.com/huggingface/peft.git
-git+https://github.com/huggingface/accelerate.git
+transformers
+peft
+accelerate
 datasets
 fire
 scipy

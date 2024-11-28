@@ -20,7 +20,7 @@ from peft import (
     LoraConfig,
     get_peft_model,
     get_peft_model_state_dict,
-    prepare_model_for_int8_training,
+    # prepare_model_for_int8_training,
     set_peft_model_state_dict,
 )
 from transformers import LlamaForCausalLM, LlamaTokenizer
@@ -416,5 +416,33 @@ def train(
 
 
 if __name__ == "__main__":
-    fire.Fire(train)
+    # # execute from CLI
+    # fire.Fire(train)
+
+    # execute from code
+    train(
+        # model/data params
+        base_model = "meta-llama/Llama-3.1-8B",  # the only required argument
+        # base_model = "meta-llama/Llama-3.2-3B",  # the only required argument
+        data_path = "yahma/alpaca-cleaned",
+        # training hyperparams
+        batch_size = 128,
+        micro_batch_size = 16,
+        num_epochs = 1,
+        learning_rate = 3e-4,
+        cutoff_len = 256,
+        val_set_size = 2000,
+        # lora hyperparams
+        lora_r = 8,
+        lora_alpha = 16,
+        lora_dropout = 0.05,
+        lora_target_modules = [
+            "q_proj",
+            "v_proj",
+            "k_proj",
+            "o_proj",
+        ],
+        # llm hyperparams
+        train_on_inputs = False,  # if False, masks out inputs in loss
+    )
 
