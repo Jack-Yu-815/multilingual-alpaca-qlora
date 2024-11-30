@@ -5,9 +5,12 @@ from typing import List
 import fire
 import torch
 import transformers
+import datasets
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, LlamaTokenizerFast, RwkvForCausalLM
+from trl import DataCollatorForCompletionOnlyLM, SFTTrainer, SFTConfig
 from peft import prepare_model_for_kbit_training
+from tqdm.auto import tqdm
 
 from utils.smart_tokenizer import smart_tokenizer_and_embedding_resize
 """
@@ -28,6 +31,81 @@ from transformers import LlamaForCausalLM, LlamaTokenizer
 from utils.prompter import Prompter
 from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from transformers.trainer_callback import TrainerCallback
+
+
+def zip_parallel_datasets(english_dataset, *datasets):
+    """
+    Zips datasets together, assuming they have the same length.
+    The new dataset should be twice as long as the original English instruction tuning datasets.
+    The target language for each engligh instruction is selected round robin.
+    """
+
+    # What should be the format?
+    #   e.g. English instructions are at odd indices of the dataset, and the target languages are at even indices.
+    #   This way, if we ensure that batch size is a multiple of 2, we can always determine a pair of <English, target-language> instructions. 
+    #   But we may have to discard the last partial batch.
+
+    
+    # first shuffle all datasets with the same seed to maintain the correspondence between the datasets
+    # then zip
+
+    # TODO: create a new dataset `datasets.dataset_dict.DatasetDict`
+    pass
+
+
+class LanguageContrastiveSFTTrainer(SFTTrainer):
+    def find_first_non_ignore_index(self, tensor):
+        # Find the first index in each row where the value doesn't match the given number
+        ignore_index = self.data_collator.ignore_index
+        indices = []
+        for row in tensor:
+            # Get indices where the row elements are not equal to the number
+            not_matching_indices = (row != ignore_index).nonzero(as_tuple=True)[0]
+            # Append the first such index, or -1 if all elements match the number
+            indices.append(not_matching_indices[0].item() if not_matching_indices.numel() > 0 else -1)
+        return torch.tensor(indices, device=tensor.device)
+
+    def compute_contrastive_loss(self, outputs, first_non_ignore_indices):
+        # TODO: Implement contrastive loss
+        # # Get the first decoder layer's hidden states from the model. (hidden_states[0] is the embedding outbut. hidden_states[1] is the first layer output)
+        # first_layer_hidden_states = outputs.hidden_states[1]
+        # # find pairs of hidden states that are supposed to be contrasted
+        # 
+        # # Compute the contrastive loss
+
+        # FIXME: This is a dummy implementation!!
+        return torch.tensor([1.0], device=outputs.hidden_states[0].device)
+    
+    # Override the `compute_loss` method to add contrastive loss
+    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+        # add output_hidden_states=True when calling the model. Same as: model(**inputs, output_hidden_states=True)
+        inputs["output_hidden_states"] = True
+        # print(inputs.keys())
+        # compute the standard SFT loss
+        nll_loss, outputs = super().compute_loss(model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
+        
+        # print the hidden states shape
+        # print(len(outputs.hidden_states), "hidden states", outputs.hidden_states[0].shape)
+
+        labels = inputs["labels"]
+        first_non_ignore_indices = self.find_first_non_ignore_index(labels)  # a 1D tensor
+        contrastive_loss = self.compute_contrastive_loss(outputs, first_non_ignore_indices)
+
+        # log the original value of loss components
+        self.log({
+            "nll_loss": nll_loss.item(),
+            "contrastive_loss": contrastive_loss.item()
+        })
+        
+        # # normalize contrastive loss to the same scale as nll_loss, then sum them as total loss
+        # contrastive_loss = contrastive_loss * nll_loss.item() / contrastive_loss.item()
+        # TODO: how to assign ratio?
+        loss = nll_loss + contrastive_loss
+        
+        # return (nll_loss, outputs) if return_outputs else nll_loss
+
+        return (loss, outputs) if return_outputs else loss
+
 
 class SavePeftModelCallback(transformers.TrainerCallback):
     def save_model(self, args, state, kwargs):
@@ -64,9 +142,16 @@ bnb_config = BitsAndBytesConfig(
     bnb_4bit_compute_dtype=torch.bfloat16
 )
 
-DEFAULT_PAD_TOKEN = "[PAD]"
-DEFAULT_EOS_TOKEN = "</s>"
-DEFAULT_BOS_TOKEN = "<s>"
+# # Llama2 special tokens
+# DEFAULT_PAD_TOKEN = "[PAD]"
+# DEFAULT_EOS_TOKEN = "</s>"
+# DEFAULT_BOS_TOKEN = "<s>"
+# DEFAULT_UNK_TOKEN = "<unk>"
+
+# Llama3 special tokens
+DEFAULT_PAD_TOKEN = "<|finetune_right_pad_id|>"
+DEFAULT_EOS_TOKEN = "<|end_of_text|>"
+DEFAULT_BOS_TOKEN = "<|begin_of_text|>"
 DEFAULT_UNK_TOKEN = "<unk>"
 
 def print_trainable_parameters(model):
@@ -94,6 +179,7 @@ def train(
     micro_batch_size: int = 4,
     num_epochs: int = 3,
     learning_rate: float = 3e-4,
+    warmup_ratio: float = 0.1,
     cutoff_len: int = 256,
     val_set_size: int = 2000,
     # lora hyperparams
@@ -108,7 +194,8 @@ def train(
     train_on_inputs: bool = True,  # if False, masks out inputs in loss
     add_eos_token: bool = False,
     group_by_length: bool = False,  # faster, but produces an odd training loss curve
-    # wandb params
+    # logging params
+    logging_steps: int = 10,
     wandb_project: str = "",
     wandb_run_name: str = "",
     wandb_watch: str = "",  # options: false | gradients | all
@@ -129,6 +216,7 @@ def train(
             f"micro_batch_size: {micro_batch_size}\n"
             f"num_epochs: {num_epochs}\n"
             f"learning_rate: {learning_rate}\n"
+            f"warmup_ratio: {warmup_ratio}\n"
             f"cutoff_len: {cutoff_len}\n"
             f"val_set_size: {val_set_size}\n"
             f"lora_r: {lora_r}\n"
@@ -251,29 +339,7 @@ def train(
             tokenizer.unk_token_id = tokenizer.pad_token_id
             
 
-    #tokenizer.padding_side = "left"  # Allow batched inference
-
-    def tokenize(prompt, add_eos_token=True):
-        # there's probably a way to do this with the tokenizer settings
-        # but again, gotta move fast
-        result = tokenizer(
-            prompt,
-            truncation=True,
-            max_length=cutoff_len,
-            padding=False,
-            return_tensors=None,
-        )
-        if (
-            result["input_ids"][-1] != tokenizer.eos_token_id
-            and len(result["input_ids"]) < cutoff_len
-            and add_eos_token
-        ):
-            result["input_ids"].append(tokenizer.eos_token_id)
-            result["attention_mask"].append(1)
-
-        result["labels"] = result["input_ids"].copy()
-
-        return result
+    # tokenizer.padding_side = "left"  # Allow batched inference
 
     def generate_and_tokenize_prompt(data_point):
         full_prompt = prompter.generate_prompt(
@@ -281,25 +347,16 @@ def train(
             data_point["input"],
             data_point["output"],
         )
-        tokenized_full_prompt = tokenize(full_prompt)
-        if not train_on_inputs:
-            user_prompt = prompter.generate_prompt(
-                data_point["instruction"], data_point["input"]
-            )
-            tokenized_user_prompt = tokenize(
-                user_prompt, add_eos_token=add_eos_token
-            )
-            user_prompt_len = len(tokenized_user_prompt["input_ids"])
 
-            if add_eos_token:
-                user_prompt_len -= 1
+        full_prompt_tokens = tokenizer.encode(full_prompt, return_tensors="pt")
+        output_tokens = tokenizer.encode(data_point["output"], return_tensors="pt")
 
-            tokenized_full_prompt["labels"] = [
-                -100
-            ] * user_prompt_len + tokenized_full_prompt["labels"][
-                user_prompt_len:
-            ]  # could be sped up, probably
-        return tokenized_full_prompt
+        response_start_index = full_prompt_tokens.shape[1] - output_tokens.shape[1] 
+
+        return {
+            "text": full_prompt, 
+            "response_start_index": response_start_index
+        }
 
     if isinstance(model, RwkvForCausalLM):
         use_gradient_checkpointing=False
@@ -361,19 +418,40 @@ def train(
         # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
         model.is_parallelizable = True
         model.model_parallel = True
+    
+    # data collator
+    instruction_template = "### Instruction:\n"
+    response_template = "### Response:\n"
+    if train_on_inputs:
+        collator = DataCollatorForLanguageModeling(
+            tokenizer=tokenizer, 
+            mlm=False,
+            pad_to_multiple_of=8, 
+            return_tensors="pt",
+        )
+    else:
+        collator = DataCollatorForCompletionOnlyLM(
+            instruction_template=instruction_template, 
+            response_template=response_template, 
+            tokenizer=tokenizer, 
+            mlm=False,
+            pad_to_multiple_of=8, 
+            return_tensors="pt", 
+        )
 
-    trainer = transformers.Trainer(
+    trainer = LanguageContrastiveSFTTrainer(
         model=model,
         train_dataset=train_data,
         eval_dataset=val_data,
-        args=transformers.TrainingArguments(
+        args=SFTConfig(
             per_device_train_batch_size=micro_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
-            warmup_steps=100,
+            max_seq_length=cutoff_len,
+            warmup_ratio=warmup_ratio,
             num_train_epochs=num_epochs,
             learning_rate=learning_rate,
             bf16=True,
-            logging_steps=10,
+            logging_steps=logging_steps,
             optim="paged_adamw_8bit",
             evaluation_strategy="steps" if val_set_size > 0 else "no",
             save_strategy="steps",
@@ -388,9 +466,7 @@ def train(
             report_to="wandb" if use_wandb else None,
             run_name=wandb_run_name if use_wandb else None,
         ),
-        data_collator=transformers.DataCollatorForSeq2Seq(
-            tokenizer, pad_to_multiple_of=8, return_tensors="pt", padding=True
-        ),
+        data_collator=collator,
         callbacks=[SavePeftModelCallback]
     )
     model.config.use_cache = False
@@ -426,11 +502,11 @@ if __name__ == "__main__":
         # base_model = "meta-llama/Llama-3.2-3B",  # the only required argument
         data_path = "yahma/alpaca-cleaned",
         # training hyperparams
-        batch_size = 128,
-        micro_batch_size = 16,
+        batch_size = 32,
+        micro_batch_size = 8,
         num_epochs = 1,
         learning_rate = 3e-4,
-        cutoff_len = 256,
+        cutoff_len = 512,
         val_set_size = 2000,
         # lora hyperparams
         lora_r = 8,
@@ -444,5 +520,7 @@ if __name__ == "__main__":
         ],
         # llm hyperparams
         train_on_inputs = False,  # if False, masks out inputs in loss
+        # logging params
+        logging_steps=5,
     )
 
