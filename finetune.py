@@ -14,6 +14,7 @@ from peft import prepare_model_for_kbit_training
 from safetensors.torch import load_file
 import torch.nn.functional as F
 from tqdm.auto import tqdm
+import wandb
 
 from utils.smart_tokenizer import smart_tokenizer_and_embedding_resize
 from utils.huggingface import upload_model_to_hf
@@ -208,7 +209,8 @@ class LanguageContrastiveSFTTrainer(SFTTrainer):
         if self.args.logging_steps > 0 and self.state.global_step % self.args.logging_steps == 0:
             self.log({
                 "nll_loss": nll_loss.item(),
-                "contrastive_loss": contrastive_loss.item()
+                "contrastive_loss": contrastive_loss.item(),
+                'learning_rate': self.optimizer.param_groups[0]['lr'],
             })
         
         # TODO: how to assign ratio?
@@ -217,34 +219,34 @@ class LanguageContrastiveSFTTrainer(SFTTrainer):
         return (loss, outputs) if return_outputs else loss
 
 
-class SavePeftModelCallback(transformers.TrainerCallback):
-    def save_model(self, args, state, kwargs):
-        print('Saving PEFT checkpoint...')
-        if state.best_model_checkpoint is not None:
-            checkpoint_folder = os.path.join(state.best_model_checkpoint, "adapter_model")
-        else:
-            checkpoint_folder = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
+# class SavePeftModelCallback(transformers.TrainerCallback):
+#     def save_model(self, args, state, kwargs):
+#         print('Saving PEFT checkpoint...')
+#         if state.best_model_checkpoint is not None:
+#             checkpoint_folder = os.path.join(state.best_model_checkpoint, "adapter_model")
+#         else:
+#             checkpoint_folder = os.path.join(args.output_dir, f"{PREFIX_CHECKPOINT_DIR}-{state.global_step}")
 
-        peft_model_path = os.path.join(checkpoint_folder, "adapter_model")
-        kwargs["model"].save_pretrained(peft_model_path)
+#         peft_model_path = os.path.join(checkpoint_folder, "adapter_model")
+#         kwargs["model"].save_pretrained(peft_model_path)
 
-        pytorch_model_path = os.path.join(checkpoint_folder, "pytorch_model.bin")
-        if os.path.exists(pytorch_model_path):
-            os.remove(pytorch_model_path)
+#         pytorch_model_path = os.path.join(checkpoint_folder, "pytorch_model.bin")
+#         if os.path.exists(pytorch_model_path):
+#             os.remove(pytorch_model_path)
 
-        upload_model_to_hf(checkpoint_folder, f"peft-model-{state.global_step}")
+#         upload_model_to_hf(checkpoint_folder, f"peft-model-{state.global_step}")
 
-    def on_save(self, args, state, control, **kwargs):
-        self.save_model(args, state, kwargs)
-        return control
+#     def on_save(self, args, state, control, **kwargs):
+#         self.save_model(args, state, kwargs)
+#         return control
 
-    def on_train_end(self, args, state, control, **kwargs):
-        def touch(fname, times=None):
-            with open(fname, 'a'):
-                os.utime(fname, times)
+#     def on_train_end(self, args, state, control, **kwargs):
+#         def touch(fname, times=None):
+#             with open(fname, 'a'):
+#                 os.utime(fname, times)
 
-        touch(os.path.join(args.output_dir, 'completed'))
-        self.save_model(args, state, kwargs)
+#         touch(os.path.join(args.output_dir, 'completed'))
+#         self.save_model(args, state, kwargs)
 
 
 bnb_config = BitsAndBytesConfig(
@@ -319,10 +321,11 @@ def train(
     group_by_length: bool = False,  # faster, but produces an odd training loss curve
     # logging params
     logging_steps: int = 10,
-    wandb_project: str = "",
-    wandb_run_name: str = "",
+    wandb_project: str = None,
+    wandb_run_name: str = None,
     wandb_watch: str = "",  # options: false | gradients | all
     wandb_log_model: str = "",  # options: false | true
+    wandb_run_id: str = None,  # options: false | true
     resume_from_checkpoint: str = None,  # either training checkpoint or final adapter
     prompt_template_name: str = "alpaca",  # The prompt template to use, will default to alpaca.
     # experimental
@@ -357,6 +360,7 @@ def train(
             f"wandb_run_name: {wandb_run_name}\n"
             f"wandb_watch: {wandb_watch}\n"
             f"wandb_log_model: {wandb_log_model}\n"
+            f"wandb_run_id: {wandb_run_id}\n"
             f"resume_from_checkpoint: {resume_from_checkpoint or False}\n"
             f"prompt template: {prompt_template_name}\n"
         )
@@ -375,11 +379,11 @@ def train(
         gradient_accumulation_steps = gradient_accumulation_steps // world_size
 
     # Check if parameter passed or if set within environ
-    use_wandb = len(wandb_project) > 0 or (
+    use_wandb = wandb_project is not None or (
         "WANDB_PROJECT" in os.environ and len(os.environ["WANDB_PROJECT"]) > 0
     )
     # Only overwrite environ if wandb param passed
-    if len(wandb_project) > 0:
+    if wandb_project is not None:
         os.environ["WANDB_PROJECT"] = wandb_project
     if len(wandb_watch) > 0:
         os.environ["WANDB_WATCH"] = wandb_watch
@@ -527,17 +531,17 @@ def train(
         train_data = take_subset(
             parallel_datasets["train"], 
             train_set_size
-        ).map(generate_and_tokenize_prompt)
+        ).map(generate_and_tokenize_prompt, num_proc=os.cpu_count())
     else:
-        train_data = parallel_datasets["train"].map(generate_and_tokenize_prompt)
+        train_data = parallel_datasets["train"].map(generate_and_tokenize_prompt, num_proc=os.cpu_count())
     
     if val_set_size and val_set_size > 0:
         val_data = take_subset(
             parallel_datasets["test"], 
             val_set_size
-        ).map(generate_and_tokenize_prompt)
+        ).map(generate_and_tokenize_prompt, num_proc=os.cpu_count())
     else:
-        val_data = parallel_datasets["test"].map(generate_and_tokenize_prompt)
+        val_data = parallel_datasets["test"].map(generate_and_tokenize_prompt, num_proc=os.cpu_count())
 
     if int(os.environ.get("LOCAL_RANK", 0)) == 0:
         print(
@@ -546,25 +550,25 @@ def train(
             f"Validation set size: {len(val_data)}\n"
         )
 
-    if resume_from_checkpoint:
-        # Check the available weights and load them
-        checkpoint_name = os.path.join(
-            resume_from_checkpoint, "pytorch_model.bin"
-        )  # Full checkpoint
-        if not os.path.exists(checkpoint_name):
-            checkpoint_name = os.path.join(
-                resume_from_checkpoint, "adapter_model/adapter_model.safetensors"
-            )  # only LoRA model - LoRA config above has to fit
-            resume_from_checkpoint = (
-                False  # So the trainer won't try loading its state
-            )
-        # The two files above have a different name depending on how they were saved, but are actually the same.
-        if os.path.exists(checkpoint_name):
-            print(f"Restarting from {checkpoint_name}")
-            adapters_weights = load_file(checkpoint_name)
-            set_peft_model_state_dict(model, adapters_weights)
-        else:
-            print(f"Checkpoint {checkpoint_name} not found")
+    # if resume_from_checkpoint:
+    #     # Check the available weights and load them
+    #     checkpoint_name = os.path.join(
+    #         resume_from_checkpoint, "pytorch_model.bin"
+    #     )  # Full checkpoint
+    #     if not os.path.exists(checkpoint_name):
+    #         checkpoint_name = os.path.join(
+    #             resume_from_checkpoint, "adapter_model/adapter_model.safetensors"
+    #         )  # only LoRA model - LoRA config above has to fit
+    #         resume_from_checkpoint = (
+    #             False  # So the trainer won't try loading its state
+    #         )
+    #     # The two files above have a different name depending on how they were saved, but are actually the same.
+    #     if os.path.exists(checkpoint_name):
+    #         print(f"Restarting from {checkpoint_name}")
+    #         adapters_weights = load_file(checkpoint_name)
+    #         set_peft_model_state_dict(model, adapters_weights)
+    #     else:
+    #         print(f"Checkpoint {checkpoint_name} not found")
 
     print_trainable_parameters(model) # Be more transparent about the % of trainable params.
 
@@ -593,58 +597,58 @@ def train(
             return_tensors="pt", 
         )
 
-    trainer = LanguageContrastiveSFTTrainer(
-        model=model,
-        train_dataset=train_data,
-        eval_dataset=val_data,
-        args=LanguageContrastiveSFTConfig(
-            contrastive_loss_ratio=contrastive_loss_ratio,
-            per_device_train_batch_size=micro_batch_size,
-            dataloader_drop_last=True,  # to make sure contrastive loss is computed correctly
-            gradient_accumulation_steps=gradient_accumulation_steps,
-            max_seq_length=cutoff_len,
-            warmup_ratio=warmup_ratio,
-            num_train_epochs=num_epochs,
-            learning_rate=learning_rate,
-            bf16=True,
-            logging_steps=logging_steps,
-            optim="paged_adamw_8bit",
-            evaluation_strategy="steps" if val_set_size > 0 else "no",
-            save_strategy="steps",
-            eval_steps=500 if val_set_size > 0 else None,
-            save_steps=500,
-            output_dir=output_dir,
-            save_total_limit=3,
-            #load_best_model_at_end=True if val_set_size > 0 else False,
-            load_best_model_at_end=False,
-            ddp_find_unused_parameters=False if ddp else None,
-            group_by_length=group_by_length,
-            report_to="wandb" if use_wandb else None,
-            run_name=wandb_run_name if use_wandb else None,
-        ),
-        data_collator=collator,
-        callbacks=[SavePeftModelCallback]
-    )
-    model.config.use_cache = False
+    with wandb.init(project=wandb_project, id=wandb_run_id, name=wandb_run_name, resume="allow") as run:
+        trainer = LanguageContrastiveSFTTrainer(
+            model=model,
+            train_dataset=train_data,
+            eval_dataset=val_data,
+            args=LanguageContrastiveSFTConfig(
+                contrastive_loss_ratio=contrastive_loss_ratio,
+                per_device_train_batch_size=micro_batch_size,
+                dataloader_drop_last=True,  # to make sure contrastive loss is computed correctly
+                gradient_accumulation_steps=gradient_accumulation_steps,
+                max_seq_length=cutoff_len,
+                warmup_ratio=warmup_ratio,
+                num_train_epochs=num_epochs,
+                learning_rate=learning_rate,
+                bf16=True,
+                logging_steps=logging_steps,
+                optim="paged_adamw_8bit",
+                evaluation_strategy="steps" if val_set_size > 0 else "no",
+                save_strategy="steps",
+                eval_steps=500 if val_set_size > 0 else None,
+                save_steps=500,
+                output_dir=output_dir,
+                save_total_limit=3,
+                #load_best_model_at_end=True if val_set_size > 0 else False,
+                load_best_model_at_end=False,
+                ddp_find_unused_parameters=False if ddp else None,
+                group_by_length=group_by_length,
+                report_to="wandb" if use_wandb else None,
+                run_name=wandb_run_name if use_wandb else None,
+            ),
+            data_collator=collator,
+        )
+        model.config.use_cache = False
 
-#    old_state_dict = model.state_dict
-#    model.state_dict = (
-#        lambda self, *_, **__: get_peft_model_state_dict(
-#            self, old_state_dict()
-#        )
-#    ).__get__(model, type(model))
+    #    old_state_dict = model.state_dict
+    #    model.state_dict = (
+    #        lambda self, *_, **__: get_peft_model_state_dict(
+    #            self, old_state_dict()
+    #        )
+    #    ).__get__(model, type(model))
 
 
-    #if torch.__version__ >= "2" and sys.platform != "win32":
-    #    model = torch.compile(model)
+        #if torch.__version__ >= "2" and sys.platform != "win32":
+        #    model = torch.compile(model)
 
-    trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
 
-    model.save_pretrained(output_dir)
+        model.save_pretrained(output_dir)
 
-    print(
-        "\n If there's a warning about missing keys above, please disregard :)"
-    )
+        print(
+            "\n If there's a warning about missing keys above, please disregard :)"
+        )
 
 
 if __name__ == "__main__":
@@ -667,9 +671,9 @@ if __name__ == "__main__":
         num_epochs = 2,
         learning_rate = 3e-4,
         cutoff_len = 512,
-        contrastive_loss_ratio = 0.25, 
+        contrastive_loss_ratio = 0.2, 
         val_size=0.05,
-        val_set_size=5000,
+        val_set_size=1000,
         # lora hyperparams
         lora_r = 8,
         lora_alpha = 16,
@@ -685,5 +689,9 @@ if __name__ == "__main__":
         # logging params
         # resume_from_checkpoint="lora-alpaca/checkpoint-4",
         logging_steps=5,
+        wandb_log_model="checkpoint",
+        wandb_project="huggingface",
+        wandb_run_name="qlora-alpaca-ratio-0.2",
+        wandb_run_id=None,
     )
 
