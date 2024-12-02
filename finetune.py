@@ -2,17 +2,21 @@ import os
 import sys
 from typing import List
 
+from dataclasses import dataclass
 import fire
 import torch
 import transformers
 import datasets
-from datasets import load_dataset
+from datasets import load_dataset, concatenate_datasets
 from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, LlamaTokenizerFast, RwkvForCausalLM
 from trl import DataCollatorForCompletionOnlyLM, SFTTrainer, SFTConfig
 from peft import prepare_model_for_kbit_training
+from safetensors.torch import load_file
+import torch.nn.functional as F
 from tqdm.auto import tqdm
 
 from utils.smart_tokenizer import smart_tokenizer_and_embedding_resize
+from utils.huggingface import upload_model_to_hf
 """
 Unused imports:
 import torch.nn as nn
@@ -33,24 +37,73 @@ from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
 from transformers.trainer_callback import TrainerCallback
 
 
-def zip_parallel_datasets(english_dataset, *datasets):
+def zip_parallel_datasets(english_dataset, *parallel_datasets, val_size=0.1):
     """
-    Zips datasets together, assuming they have the same length.
-    The new dataset should be twice as long as the original English instruction tuning datasets.
-    The target language for each engligh instruction is selected round robin.
-    """
-
-    # What should be the format?
-    #   e.g. English instructions are at odd indices of the dataset, and the target languages are at even indices.
-    #   This way, if we ensure that batch size is a multiple of 2, we can always determine a pair of <English, target-language> instructions. 
-    #   But we may have to discard the last partial batch.
-
+    Zips datasets together with round-robin target language selection. The new dataset will be twice 
+    as long as the original English dataset, with each English instruction followed by its translation
+    in the selected target language.
     
-    # first shuffle all datasets with the same seed to maintain the correspondence between the datasets
-    # then zip
+    The target language for each English instruction is selected in round-robin fashion. For example,
+    with English, German, French, Spanish, Italian:
+    - English1 pairs with German
+    - English2 pairs with French  
+    - English3 pairs with Spanish
+    - English4 pairs with Italian
+    - English5 pairs with German (cycle starts over)
+    - and so on...
 
-    # TODO: create a new dataset `datasets.dataset_dict.DatasetDict`
-    pass
+    Format:
+    - English instructions are at even indices (0, 2, ...), and target languages are at odd indices (1, 3, ...).
+    - This ensures that when batch size is a multiple of 2, we can always determine pairs of 
+      <English, target-language> instructions.
+    - The last partial batch may need to be discarded.
+
+    Args:
+        english_dataset: The base English dataset
+        *datasets: Variable number of target language datasets (German, French, etc.)
+        
+    Example:
+        zip_parallel_datasets(english_data, german_data, french_data, spanish_data, italian_data)
+
+    Returns:
+        A DatasetDict containing 'train', and 'validation' splits of the interleaved data.
+    """
+    if not 0 <= val_size < 1:
+        raise ValueError("Invalid split proportions.")
+
+    # Shuffle all datasets with the same seed to maintain correspondence between them, then zip
+    seed = 42
+    english_dataset = english_dataset.shuffle(seed=seed)
+    # Keep each language dataset separate but shuffled
+    target_datasets = tuple(dataset.shuffle(seed=seed) for dataset in parallel_datasets)
+    
+    # Create interleaved dataset
+    combined_examples = []
+    num_english = len(english_dataset)
+    num_target_langs = len(target_datasets)
+    
+    for idx in range(num_english):
+        # Add English example
+        combined_examples.append(english_dataset[idx])
+        # Add corresponding target language example
+        target_lang_idx = idx % num_target_langs
+        combined_examples.append(target_datasets[target_lang_idx][idx])
+    
+    # Create the combined dataset
+    full_dataset = datasets.Dataset.from_list(combined_examples)
+    
+    # Split into train/validation/test sets
+    splits = full_dataset.train_test_split(test_size=val_size, seed=seed)
+    
+    return datasets.DatasetDict({
+        'train': splits['train'],
+        'test': splits['test']
+    })
+
+
+@dataclass
+class LanguageContrastiveSFTConfig(SFTConfig):
+    contrastive_loss_ratio: float = 1.0
 
 
 class LanguageContrastiveSFTTrainer(SFTTrainer):
@@ -72,9 +125,69 @@ class LanguageContrastiveSFTTrainer(SFTTrainer):
         # # find pairs of hidden states that are supposed to be contrasted
         # 
         # # Compute the contrastive loss
+        """
+        Compute contrastive loss based on hidden states of paired examples.
+        Assumes batch is organized as [en1, tr1, en2, tr2, ...] where:
+        - en1 and tr1 form a positive pair
+        - en2 and tr2 form a positive pair
+        - all other combinations are negative pairs
+        """
+        # Get first decoder layer hidden states
+        hidden_states = outputs.hidden_states[1]  # shape: [batch_size, seq_len, hidden_dim]
+        batch_size = hidden_states.size(0)
+        
+        if batch_size % 2 != 0:
+            return 0  # Skip contrastive loss if batch size is odd
+        
+        # Extract sentence representations using the first non-ignore indices
+        # Shape: [batch_size, hidden_dim]
+        sentence_reps = [hidden_states[i, 0:first_non_ignore_indices[i]] for i in range(batch_size)]  # A list of [input_len, hidden_dim] arrays
+        
+        # # Normalize the representations (important for stable training)
+        # sentence_reps = [F.normalize(hidden, p=2, dim=1) for hidden in sentence_reps]  # A list of [input_len, hidden_dim] arrays (normalized)
 
-        # FIXME: This is a dummy implementation!!
-        return torch.tensor([1.0], device=outputs.hidden_states[0].device)
+        # apply mean pooling
+        sentence_reps = [torch.mean(hidden, dim=0) for hidden in sentence_reps]  # A list of [hidden_dim] arrays
+        sentence_reps = torch.stack(sentence_reps)  # Shape: [batch_size, hidden_dim]
+        
+        # Calculate similarity matrix
+        # Shape: [batch_size, batch_size]
+        temperature = 0.05  # self.model.config.temperature
+        sim_matrix = torch.matmul(sentence_reps, sentence_reps.transpose(0, 1)) / temperature
+        
+        # Create mask for positive pairs
+        # For batch [en1, tr1, en2, tr2], positives are (en1,tr1) and (en2,tr2)
+        labels = torch.zeros_like(sim_matrix)
+        for i in range(0, batch_size, 2):
+            if i + 1 < batch_size:
+                # Mark (en->tr) and (tr->en) as positive pairs
+                labels[i, i+1] = 1
+                labels[i+1, i] = 1
+        
+        # For numerical stability
+        sim_matrix_exp = torch.exp(sim_matrix)
+        
+        # Calculate loss for each example
+        loss = 0
+        num_pairs = 0
+        for i in range(batch_size):
+            positive_pairs = labels[i].nonzero().squeeze(dim=-1)
+
+            # Denominator sums over all except self (diagonal)
+            denominator = sim_matrix_exp[i].sum()
+
+            if positive_pairs.numel() > 0:  # if this example has a positive pair
+                # For each positive pair of current example
+                for pos_idx in positive_pairs:
+                    numerator = sim_matrix_exp[i, pos_idx]  # exp(sim(en, tr+))        
+                    loss -= torch.log(numerator / denominator)
+                    num_pairs += 1
+        
+        # Average loss over actual pairs
+        if num_pairs > 0:
+            loss = loss / num_pairs
+        
+        return loss
     
     # Override the `compute_loss` method to add contrastive loss
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
@@ -97,12 +210,8 @@ class LanguageContrastiveSFTTrainer(SFTTrainer):
             "contrastive_loss": contrastive_loss.item()
         })
         
-        # # normalize contrastive loss to the same scale as nll_loss, then sum them as total loss
-        # contrastive_loss = contrastive_loss * nll_loss.item() / contrastive_loss.item()
         # TODO: how to assign ratio?
-        loss = nll_loss + contrastive_loss
-        
-        # return (nll_loss, outputs) if return_outputs else nll_loss
+        loss = nll_loss + self.args.contrastive_loss_ratio * contrastive_loss
 
         return (loss, outputs) if return_outputs else loss
 
@@ -121,6 +230,8 @@ class SavePeftModelCallback(transformers.TrainerCallback):
         pytorch_model_path = os.path.join(checkpoint_folder, "pytorch_model.bin")
         if os.path.exists(pytorch_model_path):
             os.remove(pytorch_model_path)
+
+        upload_model_to_hf(checkpoint_folder, f"peft-model-{state.global_step}")
 
     def on_save(self, args, state, control, **kwargs):
         self.save_model(args, state, kwargs)
@@ -168,10 +279,17 @@ def print_trainable_parameters(model):
         f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}"
     )
 
+def take_subset(dataset, size):
+    """Helper function to take a subset of a dataset"""
+    if size is None or size >= len(dataset):
+        return dataset
+    return dataset.select(range(size))
+
 def train(
     # model/data params
     base_model: str = "",  # the only required argument
-    data_path: str = "yahma/alpaca-cleaned",
+    english_data_path: str = "yahma/alpaca-cleaned",  # base English dataset
+    target_data_paths: List[str] = [],  # paths to target language datasets
     output_dir: str = "./lora-alpaca",
     device_map: str = "auto",
     # training hyperparams
@@ -179,9 +297,13 @@ def train(
     micro_batch_size: int = 4,
     num_epochs: int = 3,
     learning_rate: float = 3e-4,
-    warmup_ratio: float = 0.1,
+    warmup_ratio: float = 0.05,
     cutoff_len: int = 256,
-    val_set_size: int = 2000,
+    contrastive_loss_ratio: float = 1.5, 
+    # dataset splitting params
+    val_size: float = 0.1,
+    train_set_size: int = None,  # Set to None to use full training split
+    val_set_size: int = None,    # Set to None to use full validation split
     # lora hyperparams
     lora_r: int = 8,
     lora_alpha: int = 16,
@@ -210,7 +332,8 @@ def train(
         print(
             f"Training Alpaca-LoRA model with params:\n"
             f"base_model: {base_model}\n"
-            f"data_path: {data_path}\n"
+            f"english_data_path: {english_data_path}\n"
+            f"target_data_paths: {target_data_paths}\n"
             f"output_dir: {output_dir}\n"
             f"batch_size: {batch_size}\n"
             f"micro_batch_size: {micro_batch_size}\n"
@@ -218,6 +341,9 @@ def train(
             f"learning_rate: {learning_rate}\n"
             f"warmup_ratio: {warmup_ratio}\n"
             f"cutoff_len: {cutoff_len}\n"
+            f"contrastive_loss_ratio: {contrastive_loss_ratio}\n"
+            f"val_size: {val_size}\n"
+            f"train_set_size: {train_set_size}\n"
             f"val_set_size: {val_set_size}\n"
             f"lora_r: {lora_r}\n"
             f"lora_alpha: {lora_alpha}\n"
@@ -374,10 +500,50 @@ def train(
     )
     model = get_peft_model(model, config)
 
-    if data_path.endswith(".json") or data_path.endswith(".jsonl"):
-        data = load_dataset("json", data_files=data_path)
+    # Load datasets
+    if english_data_path.endswith(".json") or english_data_path.endswith(".jsonl"):
+        english_dataset = load_dataset("json", data_files=english_data_path)["train"]
     else:
-        data = load_dataset(data_path)
+        english_dataset = load_dataset(english_data_path)["train"]
+    
+    target_datasets = []
+    for data_path in target_data_paths:
+        if data_path.endswith(".json") or data_path.endswith(".jsonl"):
+            dataset = load_dataset("json", data_files=data_path)["train"]
+        else:
+            dataset = load_dataset(data_path)["train"]
+        target_datasets.append(dataset)
+
+    # Create parallel datasets
+    parallel_datasets = zip_parallel_datasets(
+        english_dataset, 
+        *target_datasets,
+        val_size=val_size
+    )
+
+    # Take subsets of each split if sizes are specified
+    if train_set_size and train_set_size > 0:
+        train_data = take_subset(
+            parallel_datasets["train"], 
+            train_set_size
+        ).map(generate_and_tokenize_prompt)
+    else:
+        train_data = parallel_datasets["train"].map(generate_and_tokenize_prompt)
+    
+    if val_set_size and val_set_size > 0:
+        val_data = take_subset(
+            parallel_datasets["test"], 
+            val_set_size
+        ).map(generate_and_tokenize_prompt)
+    else:
+        val_data = parallel_datasets["test"].map(generate_and_tokenize_prompt)
+
+    if int(os.environ.get("LOCAL_RANK", 0)) == 0:
+        print(
+            f"\nDataset sizes after splitting and subsetting:\n"
+            f"Training set size: {len(train_data)}\n"
+            f"Validation set size: {len(val_data)}\n"
+        )
 
     if resume_from_checkpoint:
         # Check the available weights and load them
@@ -386,7 +552,7 @@ def train(
         )  # Full checkpoint
         if not os.path.exists(checkpoint_name):
             checkpoint_name = os.path.join(
-                resume_from_checkpoint, "adapter_model.bin"
+                resume_from_checkpoint, "adapter_model/adapter_model.safetensors"
             )  # only LoRA model - LoRA config above has to fit
             resume_from_checkpoint = (
                 False  # So the trainer won't try loading its state
@@ -394,25 +560,12 @@ def train(
         # The two files above have a different name depending on how they were saved, but are actually the same.
         if os.path.exists(checkpoint_name):
             print(f"Restarting from {checkpoint_name}")
-            adapters_weights = torch.load(checkpoint_name)
+            adapters_weights = load_file(checkpoint_name)
             set_peft_model_state_dict(model, adapters_weights)
         else:
             print(f"Checkpoint {checkpoint_name} not found")
 
     print_trainable_parameters(model) # Be more transparent about the % of trainable params.
-    if val_set_size > 0:
-        train_val = data["train"].train_test_split(
-            test_size=val_set_size, shuffle=True, seed=42
-        )
-        train_data = (
-            train_val["train"].shuffle().map(generate_and_tokenize_prompt)
-        )
-        val_data = (
-            train_val["test"].shuffle().map(generate_and_tokenize_prompt)
-        )
-    else:
-        train_data = data["train"].shuffle().map(generate_and_tokenize_prompt)
-        val_data = None
 
     if not ddp and torch.cuda.device_count() > 1:
         # keeps Trainer from trying its own DataParallelism when more than 1 gpu is available
@@ -443,8 +596,10 @@ def train(
         model=model,
         train_dataset=train_data,
         eval_dataset=val_data,
-        args=SFTConfig(
+        args=LanguageContrastiveSFTConfig(
+            contrastive_loss_ratio=contrastive_loss_ratio,
             per_device_train_batch_size=micro_batch_size,
+            dataloader_drop_last=True,  # to make sure contrastive loss is computed correctly
             gradient_accumulation_steps=gradient_accumulation_steps,
             max_seq_length=cutoff_len,
             warmup_ratio=warmup_ratio,
@@ -456,7 +611,7 @@ def train(
             evaluation_strategy="steps" if val_set_size > 0 else "no",
             save_strategy="steps",
             eval_steps=100 if val_set_size > 0 else None,
-            save_steps=100,
+            save_steps=200,
             output_dir=output_dir,
             save_total_limit=3,
             #load_best_model_at_end=True if val_set_size > 0 else False,
@@ -499,15 +654,21 @@ if __name__ == "__main__":
     train(
         # model/data params
         base_model = "meta-llama/Llama-3.1-8B",  # the only required argument
-        # base_model = "meta-llama/Llama-3.2-3B",  # the only required argument
-        data_path = "yahma/alpaca-cleaned",
+        english_data_path="yahma/alpaca-cleaned",
+        target_data_paths=[
+            "pinzhenchen/alpaca-cleaned-de",
+            "pinzhenchen/alpaca-cleaned-es",
+            "pinzhenchen/alpaca-cleaned-fr"
+        ],
         # training hyperparams
         batch_size = 32,
         micro_batch_size = 8,
-        num_epochs = 1,
+        num_epochs = 2,
         learning_rate = 3e-4,
         cutoff_len = 512,
-        val_set_size = 2000,
+        contrastive_loss_ratio = 0.25, 
+        val_size=0.05,
+        val_set_size=5000,
         # lora hyperparams
         lora_r = 8,
         lora_alpha = 16,
@@ -521,6 +682,7 @@ if __name__ == "__main__":
         # llm hyperparams
         train_on_inputs = False,  # if False, masks out inputs in loss
         # logging params
+        # resume_from_checkpoint="lora-alpaca/checkpoint-4",
         logging_steps=5,
     )
 
