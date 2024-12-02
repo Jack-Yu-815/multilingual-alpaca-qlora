@@ -205,10 +205,11 @@ class LanguageContrastiveSFTTrainer(SFTTrainer):
         contrastive_loss = self.compute_contrastive_loss(outputs, first_non_ignore_indices)
 
         # log the original value of loss components
-        self.log({
-            "nll_loss": nll_loss.item(),
-            "contrastive_loss": contrastive_loss.item()
-        })
+        if self.args.logging_steps > 0 and self.state.global_step % self.args.logging_steps == 0:
+            self.log({
+                "nll_loss": nll_loss.item(),
+                "contrastive_loss": contrastive_loss.item()
+            })
         
         # TODO: how to assign ratio?
         loss = nll_loss + self.args.contrastive_loss_ratio * contrastive_loss
@@ -610,8 +611,8 @@ def train(
             optim="paged_adamw_8bit",
             evaluation_strategy="steps" if val_set_size > 0 else "no",
             save_strategy="steps",
-            eval_steps=100 if val_set_size > 0 else None,
-            save_steps=200,
+            eval_steps=500 if val_set_size > 0 else None,
+            save_steps=500,
             output_dir=output_dir,
             save_total_limit=3,
             #load_best_model_at_end=True if val_set_size > 0 else False,
@@ -661,7 +662,7 @@ if __name__ == "__main__":
             "pinzhenchen/alpaca-cleaned-fr"
         ],
         # training hyperparams
-        batch_size = 32,
+        batch_size = 64,
         micro_batch_size = 8,
         num_epochs = 2,
         learning_rate = 3e-4,
